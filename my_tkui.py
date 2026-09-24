@@ -37,6 +37,7 @@ import tkinter as tk
 import tkinter.font as tkFont
 from tkinter import filedialog, scrolledtext
 from pathlib import Path
+import re
 import threading
 from typing import Callable, Optional, Any
 
@@ -528,6 +529,20 @@ class LogPanel(tk.Frame):
         .native_widget：底层原生 ScrolledText 对象，用于高级自定义
         .on_save：Ctrl+S触发的回调函数
         .read_only：是否只读（True/False，可直接改，也可以用 set_read_only）
+    行号（默认打开）：
+        构造时 show_line_numbers=False 可关闭；也可以随时 panel.set_line_numbers(False) 切换
+        行号画在左侧的 .gutter 画布上，随文本滚动自动跟随，增删行自动重排
+        set_font / set_zoom 缩放字号后行号会重新对齐（行高变化也能对上）
+    语法高亮（对特定文本自动换色）：
+        add_highlight(pattern, color=..., background=..., bold=..., italic=...,
+                      underline=..., name=..., override_level=True)
+            pattern: 正则表达式字符串或已编译的正则；color=None 表示不改颜色
+            例：panel.add_highlight(r"\b(HLT|NOP)\b", color="#FF6B6B", bold=True)
+        remove_highlight(name)：按名字删掉一条规则
+        clear_highlights()：清掉全部高亮规则
+        refresh_highlights()：按当前规则重新着色（规则改过可手动调，一般不用调）
+        【重要】高亮默认覆盖类别颜色（override_level=True），所以日志面板里
+        也能用高亮把某段文字染成别的颜色；文本改动后面板会自动重新着色。
     """
     # 字号允许范围（构造、缩放、set_font 都受此限制），防止字号失控
     MIN_FONT_SIZE = 8
@@ -548,7 +563,9 @@ class LogPanel(tk.Frame):
     }
 
     def __init__(self, master, font_name="Consolas", font_size=11, fg="black",
-                 bg="white", read_only: bool = False, **kwargs):
+                 bg="white", read_only: bool = False,
+                 show_line_numbers: bool = True,
+                 line_number_color: Optional[str] = None, **kwargs):
         super().__init__(master, **kwargs)
         self.root = self.winfo_toplevel()
         self.on_save: Optional[Callable[[], None]] = None  # Ctrl+S保存回调
@@ -565,12 +582,46 @@ class LogPanel(tk.Frame):
         self._pin_w = 0
         self._pin_h = 0
 
+        # ========== 行号与语法高亮状态 ==========
+        self._show_line_numbers = bool(show_line_numbers)
+        # 行号颜色默认按背景明暗自动选：浅底用灰、深底用浅灰，保证看得清
+        self._line_number_color = line_number_color or ("#8A8A8A" if self._is_dark(bg) else "#9A9A9A")
+        self._gutter_bg = bg
+        self._gutter_width = 0
+        self._gutter_font_cache = None
+        self._gutter_digit_width = None
+        # 高亮规则：[(规则名, 正则, 样式字典, 是否覆盖类别颜色)]
+        self._highlights = []
+        # 上一次已知的内容，用来判断"文本是否变了"（比 edit_modified 可靠，见 _watch_text）
+        self._last_content = None
+        self._watch_job = None
+        self._redraw_job = None
+        self._highlight_job = None
+        # 待重算的起始行（末尾追加场景用，见 _after_content_change）
+        self._dirty_from_row = None
+        # "滚动到最后一行"的合并任务
+        self._see_job = None
+        # 上一轮巡检时的长度/行数，以及上次高亮扫描的起点与当时的长度
+        self._last_length = None
+        self._last_rows = None
+        self._scanned_from_row = None
+        self._scanned_length = None
+
         # undo=True 打开 Text 自带的撤销栈，Ctrl+Z / Ctrl+Y 才能撤销/重做。
         # 分隔符沿用 Tk 默认（autoseparators=True）：连续输入算一次撤销，
         # 关闭一次撤销范围由 Tk 自动按"操作时间/内容变化"划分
         self.text = scrolledtext.ScrolledText(self, wrap=tk.WORD, font=self.font,
                                              fg=fg, bg=bg, undo=True)
-        self.text.pack(fill=tk.BOTH, expand=True)
+        # 行号槽画在左侧 Canvas 上（不是另一个 Text 控件，省内存、也不用同步滚动条）
+        self.gutter = tk.Canvas(self, highlightthickness=0, borderwidth=0, bg=bg,
+                                width=self._gutter_width)
+        # 行号槽固定在最左列、宽度按需自适应；文本框铺满剩余空间
+        self.gutter.grid(row=0, column=0, sticky="ns")
+        self.text.grid(row=0, column=1, sticky="nsew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        if not self._show_line_numbers:
+            self.gutter.grid_remove()   # 构造时就要求关掉行号
 
         # ========== 类别配色 ==========
         self._bg_color = bg
@@ -588,6 +639,26 @@ class LogPanel(tk.Frame):
         # 第2层（外）：面板对外上报的尺寸精确等于当前像素尺寸，
         #             分栏比例在缩放时才能做到一个像素都不动
         self.bind("<Configure>", self._on_panel_configure)
+
+        # ========== 滚动 / 尺寸联动 ==========
+        # 文本框滚动时重画行号。yscrollcommand 是控件的回调选项（不是可 bind 的事件），
+        # ScrolledText 已经把它接到滚动条上了，所以这里要"链"上去：先转交原来的，
+        # 再画自己的，否则会把滚动条的回调顶掉、滚动条就失效了。
+        old_yscroll = self.text.cget("yscrollcommand")
+
+        def _on_yscroll(first, last):
+            if old_yscroll:
+                self.text.tk.call(old_yscroll, first, last)
+            self._on_text_yscroll()
+
+        self.text.config(yscrollcommand=_on_yscroll)
+        self._yscroll_callback = _on_yscroll  # 存一份引用，防止被回收
+        # 鼠标停在行号槽上也能滚
+        self.gutter.bind("<MouseWheel>", self._on_gutter_wheel)
+        # 面板销毁时撤掉后台巡检，避免窗口关掉后还去访问已销毁的控件
+        self.bind("<Destroy>", self._on_destroy)
+        # 首帧之后开始盯着内容变化
+        self.after_idle(self._watch_text)
 
         # ========== 绑定快捷键 ==========
         self.text.bind("<Control-a>", self._hotkey_select_all)
@@ -607,14 +678,24 @@ class LogPanel(tk.Frame):
 
     # ---------------- 字体颜色API ----------------
     def set_font(self, font_name: str, font_size: int):
-        """设置面板全局字体名称和字号（同样不会撑坏父容器布局）"""
+        """
+        设置面板全局字体名称和字号（不会撑坏父容器布局）。
+
+        字号变了行高也变，所以行号字体与位置会一起重新对齐。
+        """
         font_size = int(font_size)
         font_size = max(self.MIN_FONT_SIZE, min(self.MAX_FONT_SIZE, font_size))
         self.font.config(family=font_name, size=font_size)
         self.font_name = font_name
         self.font_size = font_size
+        # 行号字体跟着正文走，缓存作废后重新生成
+        self._gutter_font_cache = None
+        self._gutter_digit_width = None
+        self._gutter_width = 0
         # 换字体/字号后立即重钉请求尺寸，避免布局被撑变形
         self._pin_requested_size()
+        self.refresh_highlights()          # 高亮里带粗体/斜体，字体变了要重算
+        self._sync_modified_tracking()     # 行高变了，行号要重画
 
     def set_fg(self, color: str):
         """
@@ -638,7 +719,11 @@ class LogPanel(tk.Frame):
         """
         self._bg_color = color
         self.text.config(bg=color)
+        # 行号槽背景与文本区保持一致，看上去是一整块
+        self._gutter_bg = color
+        self.gutter.config(bg=color)
         self._apply_palette()  # 只覆盖没被用户手动指定过的类别
+        self._schedule_gutter_redraw()
 
     def set_level_color(self, level: str, color: Optional[str]):
         """
@@ -704,7 +789,7 @@ class LogPanel(tk.Frame):
         """
         【内部方法】把当前配色应用到 Text 的各个标签上。
 
-        颜色为 None 的类别（默认的 info / plain）**不打颜色标签**，
+        颜色为 None 的类别（默认的 info / plain）不打颜色标签，
         直接跟随 Text 的默认前景色（即 set_fg 设的正文色）。
         这一点很关键：如果给它们打上固定的颜色标签，之后 set_fg 改正文色时，
         已经写好的内容会被标签颜色"锁住"或被整屏重染，两种都不符合预期。
@@ -716,6 +801,403 @@ class LogPanel(tk.Frame):
                 self.text.tag_config(level, foreground="")
             else:
                 self.text.tag_config(level, foreground=color)
+        # 类别标签改动后，重新把高亮标签抬到它们上面，保证高亮颜色生效
+        self._restore_highlight_priority()
+
+    def _restore_highlight_priority(self):
+        """
+        【内部方法】按规则设置高亮标签相对类别标签的优先级。
+
+        为什么需要它：Tk 里同一个字符被多个标签覆盖时，**后创建的标签优先**。
+        而类别标签会随着 set_fg / set_bg / set_level_color 反复重新配置，
+        每次重配都会把它自己抬到最上面 —— 所以每改一次配色都要重排一次：
+            规则 override_level=True  → 高亮抬到类别标签之上，颜色说了算；
+            规则 override_level=False → 高亮降到类别标签之下，保住日志本身的颜色。
+        """
+        for rule_name, _, _, override in self._highlights:
+            try:
+                if override:
+                    self.text.tag_raise(rule_name)
+                else:
+                    self.text.tag_lower(rule_name)
+            except tk.TclError:
+                pass
+
+    # ---------------- 行号 ----------------
+    def set_line_numbers(self, show: bool = True):
+        """
+        打开 / 关闭行号显示。
+        参数：
+            show: True=显示行号（默认就是打开的），False=隐藏
+        """
+        self._show_line_numbers = bool(show)
+        if self._show_line_numbers:
+            self.gutter.grid()
+            self._schedule_gutter_redraw()
+        else:
+            self.gutter.grid_remove()
+
+    def _gutter_font(self) -> tkFont.Font:
+        """
+        【内部方法】行号用的字体：与正文同字体、字号略小一点。
+
+        行高必须与正文一致，否则行号会和文本行错位，所以只把字号调小一号
+        （Tk 的字体对象是跨控件共享的，必须单独建一个，不能直接改正文那个）。
+        """
+        size = max(self.MIN_FONT_SIZE - 2, min(self.MAX_FONT_SIZE, self.font_size - 1))
+        return tkFont.Font(family=self.font_name, size=size)
+
+    def _on_text_yscroll(self, *args):
+        """【内部方法】文本框滚动回调：行号跟着一起滚（内部方法，勿手动调用）"""
+        if self._show_line_numbers:
+            self._schedule_gutter_redraw()
+
+    def _on_gutter_wheel(self, event):
+        """鼠标停在行号槽上滚动时，把滚动转给文本框"""
+        self.text.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _schedule_gutter_redraw(self):
+        """
+        【内部方法】把行号重画合并成"至多每 40 毫秒一次"。
+
+        为什么不用 after_idle：连续写日志时每次插入都会触发滚动、
+        进而触发一次行号重画，after_idle 等于每行都重画（行数一多就很浪费）。
+        用一个小延时合并之后，滚动的观感不变，但重画次数与"写入次数"脱钩。
+        """
+        if self._redraw_job is not None:
+            return
+        try:
+            self._redraw_job = self.after(40, self._draw_line_numbers)
+        except tk.TclError:
+            self._redraw_job = None
+
+    def _draw_line_numbers(self):
+        """
+        【内部方法】重画行号槽。
+
+        只画当前可见的那几行（用文本行高算出首尾行号），所以文本再长也只画几十个数字。
+        """
+        self._redraw_job = None
+        if not self._show_line_numbers:
+            return
+        try:
+            self.gutter.delete("all")
+            if not self.text.winfo_ismapped():
+                return
+            index = self.text.index("@0,0")          # 当前可见的第一行，形如 "12.0"
+            first_row = int(index.split(".")[0])
+            height = self.text.winfo_height()
+            line_height = max(1, self.font.metrics("linespace"))
+            rows = height // line_height + 2
+            total_rows = int(self.text.index("end-1c").split(".")[0])
+            for row in range(first_row, first_row + rows):
+                if row > total_rows:
+                    break
+                bbox = self.text.bbox(f"{row}.0")
+                if bbox is None:                     # 该行还没完成布局，跳过
+                    continue
+                _, y, _, h = bbox
+                self.gutter.create_text(self._gutter_width - 4, y + h // 2,
+                                        anchor="e", text=str(row),
+                                        fill=self._line_number_color,
+                                        font=self._line_number_font())
+        except tk.TclError:
+            pass  # 面板正在销毁，忽略
+
+    def _line_number_font(self):
+        """【内部方法】行号字体（缓存起来，避免每帧都新建字体对象）"""
+        if getattr(self, "_gutter_font_cache", None) is None:
+            self._gutter_font_cache = self._gutter_font()
+        return self._gutter_font_cache
+
+    def _update_gutter_width(self):
+        """
+        【内部方法】按行数调整行号槽宽度。
+
+        宽度用"最宽的那个行号"算出来，位数从 9 变到 10 时自动加宽，不会截断。
+        数字宽度按 10 个字符量一次并缓存：每写一行都调 font.measure() 的话，
+        会白白多出几万个 Tcl 调用（实测写日志每行要多花约 1 毫秒）。
+        """
+        total_rows = max(1, int(self.text.index("end-1c").split(".")[0]))
+        digits = len(str(total_rows))
+        if self._gutter_digit_width is None:
+            font = self._line_number_font()
+            # 取 0~9 里最宽的一个，保证任何行号都放得下
+            self._gutter_digit_width = max(font.measure(str(d)) for d in range(10))
+        width = self._gutter_digit_width * digits + 10
+        if width != self._gutter_width:
+            self._gutter_width = width
+            self.gutter.config(width=width)
+
+    # ---------------- 语法高亮 ----------------
+    def add_highlight(self, pattern, color: Optional[str] = None,
+                      background: Optional[str] = None,
+                      bold: bool = False, italic: bool = False,
+                      underline: bool = False, name: Optional[str] = None,
+                      override_level: bool = True) -> str:
+        """
+        添加一条语法高亮规则：对匹配 pattern 的文本自动换色。
+
+        参数：
+            pattern: 正则表达式（字符串或已 re.compile 的对象），按整篇文本匹配
+            color: 文字颜色，支持颜色名或 #RRGGBB；None 表示不改文字颜色
+            background: 背景颜色；None 表示不改背景
+            bold / italic / underline: 是否加粗 / 倾斜 / 下划线
+            name: 规则名，便于以后 remove_highlight(name) 删除；
+                  不传则自动用 "hl_序号"
+            override_level: True（默认）表示这条规则的颜色**覆盖**日志类别颜色，
+                            可以把某段文字强行染成指定颜色；
+                            False 表示只在没有类别色的地方生效
+        返回：
+            规则名（可用于 remove_highlight）
+        示例：
+            panel.add_highlight(r"\\b(HLT|NOP)\\b", color="#FF6B6B", bold=True)
+            panel.add_highlight(r"@\\w+", color="#4EC9B0")          # 跳转标签用青色
+            panel.add_highlight(r"R[0-6]\\b", color="#DCDCAA")      # 寄存器用浅黄
+        """
+        rule_name = name or f"hl_{len(self._highlights)}"
+        if isinstance(pattern, str):
+            regex = re.compile(pattern)
+        else:
+            regex = pattern
+        style = {"foreground": color, "background": background,
+                 "bold": bool(bold), "italic": bool(italic),
+                 "underline": bool(underline)}
+        self._highlights = [h for h in self._highlights if h[0] != rule_name]
+        self._highlights.append((rule_name, regex, style, bool(override_level)))
+        self._refresh_highlight_tag(rule_name, style)
+        self.refresh_highlights()
+        return rule_name
+
+    def remove_highlight(self, name: str):
+        """删掉一条高亮规则（规则不存在也不会报错）"""
+        self._highlights = [h for h in self._highlights if h[0] != name]
+        try:
+            self.text.tag_delete(name)
+        except tk.TclError:
+            pass
+        self.refresh_highlights()
+
+    def clear_highlights(self):
+        """清掉全部高亮规则（不影响日志类别颜色）"""
+        for rule_name, _, _, _ in self._highlights:
+            try:
+                self.text.tag_delete(rule_name)
+            except tk.TclError:
+                pass
+        self._highlights = []
+        self.refresh_highlights()
+
+    def get_highlights(self) -> list:
+        """查看当前所有高亮规则名，便于调试"""
+        return [rule_name for rule_name, _, _, _ in self._highlights]
+
+    def refresh_highlights(self, from_index: str = "1.0", to_index: Optional[str] = None):
+        """
+        按当前规则给文本重新着色。
+
+        参数：
+            from_index: 从哪一行开始重算，默认 "1.0"（整篇）。
+                        写日志这种"只在末尾追加"的场景会自动只算新增的部分。
+            to_index: 只重算到哪一行（默认算到末尾）。
+        说明：
+            一般不用手动调用：写入内容后面板会自动重着色。
+        """
+        # 清掉要重算那一段上的旧高亮。
+        # 注意 to_index 一定要给：tag_remove(tag, from, "end") 会一直扫到文章末尾，
+        # 在"每写一行都重算"的场景里就是 O(n) 一次、总代价 O(n²)。
+        end_of_scope = to_index if to_index is not None else tk.END
+        try:
+            for rule_name, _, _, _ in self._highlights:
+                self.text.tag_remove(rule_name, from_index, end_of_scope)
+        except tk.TclError:
+            return
+
+        no_rules = not self._highlights
+        for rule_name, regex, style, override in self._highlights:
+            for start, end in self._iter_matches(regex, from_index, to_index):
+                try:
+                    self.text.tag_add(rule_name, start, end)
+                except tk.TclError:
+                    return
+        # 全部打完之后统一排一次优先级（Tk 的标签优先级由 tag_raise/tag_lower 决定）
+        self._restore_highlight_priority()
+        # 记下"这次扫到哪儿了"，供下一次巡检判断能否只算新增部分
+        try:
+            self._scanned_from_row = int(str(from_index).split(".")[0])
+            self._scanned_length = self._index_to_length(self.text.index("end-1c"))
+        except tk.TclError:
+            self._scanned_from_row = None
+            self._scanned_length = None
+        if not no_rules:
+            self._sync_modified_tracking()
+
+    def _refresh_highlight_tag(self, rule_name: str, style: dict):
+        """【内部方法】把样式写进标签；颜色为 None 的项不设置，避免把原有颜色顶掉"""
+        options = {}
+        if style.get("foreground") is not None:
+            options["foreground"] = style["foreground"]
+        if style.get("background") is not None:
+            options["background"] = style["background"]
+        font = tkFont.Font(font=self.text.cget("font"))
+        if style.get("bold"):
+            font.config(weight="bold")
+        if style.get("italic"):
+            font.config(slant="italic")
+        if style.get("underline"):
+            font.config(underline=True)
+        if any(style.get(k) for k in ("bold", "italic", "underline")):
+            options["font"] = font
+        self.text.tag_config(rule_name, **options)
+
+    def _iter_matches(self, regex, from_index: str = "1.0", to_index: Optional[str] = None):
+        """
+        【内部方法】遍历文本里所有匹配位置（默认从第 1 行扫到最后）。
+
+        逐行匹配：正则不会跨行吞掉换行，也不会因为多行模式意外匹配到别的行。
+        参数：
+            regex: 已编译的正则
+            from_index: 起始位置，例如 "12.0" 表示从第 12 行开始扫
+            to_index: 结束位置；给了就只扫到那一行为止（增量重算用）
+        """
+        try:
+            total_rows = int(self.text.index("end-1c").split(".")[0])
+            first_row = max(1, int(str(from_index).split(".")[0]))
+            if to_index is not None:
+                total_rows = min(total_rows, int(str(to_index).split(".")[0]))
+        except tk.TclError:
+            return  # 面板正在销毁
+        for row in range(first_row, total_rows + 1):
+            try:
+                line = self.text.get(f"{row}.0", f"{row}.end")
+            except tk.TclError:
+                return
+            for match in regex.finditer(line):
+                if match.start() == match.end():
+                    continue
+                yield (f"{row}.{match.start()}", f"{row}.{match.end()}")
+
+    # ---------------- 内容变化监听 ----------------
+    def _on_destroy(self, event=None):
+        """【内部方法】面板被销毁时撤掉后台巡检任务，避免访问已销毁的控件"""
+        for job in (self._watch_job, self._redraw_job, self._highlight_job, self._see_job):
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self._watch_job = None
+        self._redraw_job = None
+        self._highlight_job = None
+        self._see_job = None
+
+    def _watch_text(self):
+        """
+        【内部方法】定期检查文本有没有变化（Tk 没有"内容变了"事件，只能这样查）。
+
+        为什么不用 edit_modified()：它记的是"相对于上次复位有没有改动"，
+        撤销回到旧内容后会被 Tk 复位成 False，于是漏掉变化、行号和高亮就不刷新了。
+
+        为了不白白扫大文件，先比"长度 + 行数"这两个廉价指标：
+        都没变就直接跳过（绝大多数轮询走这条路，几乎不花时间）；
+        只有变了才读全文确认，并且只重算"上一次扫码起点之后"的部分。
+        """
+        self._watch_job = None
+        try:
+            end_index = self.text.index("end-1c")
+            rows = int(end_index.split(".")[0])
+            length = self._index_to_length(end_index)
+        except tk.TclError:
+            return  # 面板已销毁，不再继续
+
+        if (length, rows) != (self._last_length, self._last_rows):
+            # 长度或行数变了：确认一下内容（写入方会把 _last_content 置空要求重读）
+            if self._last_content is None:
+                try:
+                    self._last_content = self.text.get("1.0", "end-1c")
+                except tk.TclError:
+                    return
+            self._sync_modified_tracking()
+            # 只变了末尾（纯追加）就从上次扫过的位置继续，否则老实整篇重算
+            if (self._scanned_length is not None
+                    and length >= self._scanned_length
+                    and self._scanned_from_row):
+                self.refresh_highlights(f"{self._scanned_from_row}.0")
+            else:
+                self._schedule_highlight_refresh()
+
+        self._last_length, self._last_rows = length, rows
+        # 每 200 毫秒查一次，足够跟手，也不会占 CPU
+        try:
+            self._watch_job = self.after(200, self._watch_text)
+        except tk.TclError:
+            self._watch_job = None
+
+    def _sync_modified_tracking(self):
+        """【内部方法】内容或行数变化后：更新行号槽宽度并重画行号"""
+        if not self._show_line_numbers:
+            return
+        self._update_gutter_width()
+        self._schedule_gutter_redraw()
+
+    def _after_content_change(self, appended_from_row: Optional[int] = None):
+        """
+        【内部方法】写完内容后的统一收尾：刷新内容记录 + 行号 + 语法高亮。
+
+        参数：
+            appended_from_row: 如果这次只是"在末尾追加"，传新增内容的第一行行号，
+                               高亮就只重算从这里开始的部分，不必整篇重扫。
+                               连续写日志时这样处理，开销与已写行数无关。
+
+        为什么高亮要合并到空闲时算：整篇重扫是 O(n)，
+        每写一行都扫一次就退化成 O(n²)（实测 550 行会耗时 60 秒）。
+        """
+        try:
+            # 只更新"廉价指标"（行数、总字符数），不读全文：
+            # 每写一行都 get('1.0','end') 读一遍是 O(n)，同样会退化成 O(n²)。
+            # 全文比对留给 _watch_text 的定时巡检去做，那里本来就要读一次。
+            end_index = self.text.index("end-1c")
+            self._last_rows = int(end_index.split(".")[0])
+            self._last_length = self._index_to_length(end_index)
+            self._last_content = None   # 内容已变，让巡检下次读全文重新确认
+        except tk.TclError:
+            return
+        self._sync_modified_tracking()
+        if not self._highlights:
+            return
+        if appended_from_row is not None:
+            # 只在末尾追加：立刻（但只）处理新增的那几行，日志场景下这是 O(1)
+            self.refresh_highlights(f"{appended_from_row}.0")
+        else:
+            self._schedule_highlight_refresh()
+
+    def _index_to_length(self, index: str) -> int:
+        """
+        【内部方法】用 Tk 自己的计数算出"到 index 为止有多少个字符"。
+
+        等价于 len(text.get("1.0", index))，但完全在 Tcl 侧统计，不把正文读进 Python。
+        只用来判断"长度有没有变化"，所以只要前后口径一致就行。
+        """
+        try:
+            counted = self.text.count("1.0", index, "chars")
+        except tk.TclError:
+            return -1
+        return int(counted[0]) if counted else 0
+
+    def _schedule_highlight_refresh(self):
+        """【内部方法】把整篇高亮重算推迟到空闲时（多次写入只会算一次）"""
+        if not self._highlights or self._highlight_job is not None:
+            return
+        try:
+            self._highlight_job = self.after_idle(self._run_highlight_refresh)
+        except tk.TclError:
+            self._highlight_job = None
+
+    def _run_highlight_refresh(self):
+        """【内部方法】真正执行一次整篇高亮重算"""
+        self._highlight_job = None
+        self.refresh_highlights()
 
     def insert_line(self, text: str, level: str = "plain", color: Optional[str] = None):
         """
@@ -730,6 +1212,7 @@ class LogPanel(tk.Frame):
             那样之后写入的所有内容都会跟着变。
         """
         start = self.text.index("end-1c")  # 注意不是 END：END 之后的位置取不到内容
+        start_row = int(str(start).split(".")[0])
         old_state = self._writable_state()
         self.text.insert(tk.END, text)
         if color is not None:
@@ -740,9 +1223,34 @@ class LogPanel(tk.Frame):
             self.text.tag_add(tag, start, "end-1c")
         elif self._level_colors.get(level) is not None:
             self.text.tag_add(level, start, "end-1c")
-        self.text.see(tk.END)
-        self.text.update_idletasks()
+        self.text.see(tk.END)      # 滚到最新一行。
+        # 这里必须"立刻"滚：see() 让 Tk 只对可见区域做排版，一旦推迟，
+        # 排版范围会扩散到整篇文本，连续写入反而从线性退化成平方级。
         self._restore_state(old_state)
+        # 内容变了：行号与语法高亮跟着更新；这是末尾追加，所以高亮只算新增部分
+        self._after_content_change(appended_from_row=start_row)
+
+    def _schedule_see_end(self):
+        """
+        【内部方法】把"滚动到最后一行"合并到空闲时做一次。
+
+        连续写日志时如果每行都 see(END)，会触发 N 次滚动、N 次行号重画
+        （实测这部分占了写日志总耗时的一大半），合并之后只做一次。
+        """
+        if self._see_job is not None:
+            return
+        try:
+            self._see_job = self.after_idle(self._run_see_end)
+        except tk.TclError:
+            self._see_job = None
+
+    def _run_see_end(self):
+        """【内部方法】真正把视图滚到最后一行"""
+        self._see_job = None
+        try:
+            self.text.see(tk.END)
+        except tk.TclError:
+            pass
 
     def append(self, text: str, color: Optional[str] = None):
         """
@@ -767,6 +1275,7 @@ class LogPanel(tk.Frame):
         self.text.delete("1.0", tk.END)
         self._restore_state(old_state)
         self._reset_undo_baseline()
+        self._after_content_change()
 
     def set_text(self, content: str):
         """
@@ -785,6 +1294,7 @@ class LogPanel(tk.Frame):
         self.text.update_idletasks()
         self._restore_state(old_state)
         self._reset_undo_baseline()
+        self._after_content_change()
 
     def get_all_text(self, strip_last_newline: bool = True) -> str:
         """
@@ -928,8 +1438,9 @@ class LogPanel(tk.Frame):
         self.text.config(width=want_w, height=want_h)
 
     def _on_text_configure(self, event=None):
-        """文本框尺寸变化回调，用于重新钉住请求尺寸（内部方法）"""
+        """文本框尺寸变化回调：重钉请求尺寸，并让行号跟着重排（内部方法）"""
         self._pin_requested_size()
+        self._schedule_gutter_redraw()
 
     def _on_panel_configure(self, event=None):
         """
@@ -979,10 +1490,16 @@ class LogPanel(tk.Frame):
         self.font_size = font_size
         self.font.config(size=font_size)
 
+        # 行号字体跟着字号变，缓存作废后重新生成
+        self._gutter_font_cache = None
+        self._gutter_digit_width = None
+        self._gutter_width = 0
+
         # 关键：字号变了，请求尺寸必须按新字体重新换算并钉住，
         # 否则 Text 会按新字号膨胀出巨大的像素请求，把父容器布局撑坏
         self._pin_requested_size()
         self.text.yview_moveto(y_top)
+        self._sync_modified_tracking()   # 行高变了，行号重新对齐
 
     def _mousewheel_zoom(self, event):
         """Ctrl+滚轮缩放字号：仅改字号，保留视口，布局不抖动"""
@@ -1030,10 +1547,12 @@ class LogPanel(tk.Frame):
             text: 含结尾换行的文本
             level: 类别（info / warn / error / plain）
             color: 直接指定颜色（优先于类别配色）
+        说明：
+            这里不再调用 update_idletasks()：每写一行都强制刷新一遍界面，
+            连续写日志时会从线性退化成平方级（实测 2000 行要 40 多秒）。
+            see() 已经保证了滚动位置，重绘交给 Tk 的空闲周期即可。
         """
         self.insert_line(text, level=level, color=color)
-        self.text.see(tk.END)
-        self.text.update_idletasks()
 
     def safe_info(self, msg: str):
         """子线程安全版本info，子线程调用无需担心tk报错"""
