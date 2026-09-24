@@ -1,5 +1,9 @@
 # TKGUI（MyTkUI）
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
+[![标准库](https://img.shields.io/badge/依赖-零第三方-green.svg)](#环境要求)
+
 **一套用纯标准库封装 Tkinter 的轻量界面中间件，主打两件事：布局真的按比例，以及多线程真的能安全用。**
 
 `my_tkui.py` 单文件、零第三方依赖，把这几个反复折磨人的问题一次解决掉：
@@ -486,6 +490,7 @@ Tk 中同一段文字被多个标签覆盖时，**后创建的标签优先**。�
 ```
 TKGUI/
 ├── my_tkui.py          # 库本体（单文件，零依赖）
+├── LICENSE             # MIT 许可
 └── README.md           # 本文档
 ```
 
@@ -533,11 +538,15 @@ from my_tkui import AppWindow, LogPanel     # 同目录
 
 ## 许可
 
-本项目未附带许可证文件。若你计划公开分发或允许他人使用，
-建议补一个 [MIT License](https://choosealicense.com/licenses/mit/)（宽松、最常见）
-或 [Apache-2.0](https://choosealicense.com/licenses/apache-2.0/)（含专利授权）。
+[MIT License](LICENSE) © 2026 Bulehopejiang
 
-在补充许可证之前，默认保留所有权利。
+宽松许可，可以放心使用：
+
+- ✅ 商用、修改、分发、闭源再发布、私人使用都可以
+- ✅ 唯一要求：保留版权声明与许可声明（仓库里的 `LICENSE` 文件）
+- ⚠️ 作者不承担任何担保责任（软件按"现状"提供）
+
+在你自己项目的 `LICENSE` 或文档里附上本项目的 MIT 声明即可，不需要额外联系作者。
 
 ---
 
